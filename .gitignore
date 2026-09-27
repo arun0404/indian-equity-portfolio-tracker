@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 .streamlit/
+CLAUDE.md
 
 # Personal holdings/trade exports - never commit real financial data
 *.xlsx
