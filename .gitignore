@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+.streamlit/
+
+# Personal holdings/trade exports - never commit real financial data
+*.xlsx
+*.csv
