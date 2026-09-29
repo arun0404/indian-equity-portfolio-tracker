@@ -1776,6 +1776,27 @@ def group_breakdown(holdings: pd.DataFrame, by: str) -> pd.DataFrame:
     return grouped.sort_values("current_value", ascending=False).reset_index(drop=True)
 
 
+def compute_sector_drilldown(holdings: pd.DataFrame, sector: str) -> pd.DataFrame:
+    """Per-stock detail for one sector, with two distinct weight columns.
+
+    A stock's ``pct_of_sector`` (share of that sector's own value) and
+    ``pct_of_portfolio`` (share of the whole portfolio) tell different
+    stories - a stock can dominate a small sector while being a minor
+    portfolio position, or vice versa - so both are kept, not just one.
+    """
+    total_portfolio_value = float(holdings["current_value"].sum())
+    subset = holdings[holdings["sector"] == sector].copy()
+    total_sector_value = float(subset["current_value"].sum())
+    subset["pct_of_portfolio"] = (
+        subset["current_value"] / total_portfolio_value * 100
+        if total_portfolio_value > 0 else np.nan
+    )
+    subset["pct_of_sector"] = (
+        subset["current_value"] / total_sector_value * 100 if total_sector_value > 0 else np.nan
+    )
+    return subset.sort_values("current_value", ascending=False).reset_index(drop=True)
+
+
 def split_gainers_losers(holdings: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split holdings into profitable (P&L > 0) and loss-making (P&L < 0) positions."""
     profitable = holdings[holdings["unrealized_pnl"] > 0].sort_values(
@@ -2141,6 +2162,43 @@ def sector_allocation_figure(sector_breakdown: pd.DataFrame) -> go.Figure:
     ranked = sector_breakdown.sort_values("current_value", ascending=False)
     names, values, colors = _top_slices_with_others(ranked, "sector")
     return _donut_chart(names, values, colors, _is_dark_theme(), "largest<br>sector")
+
+
+def sector_drilldown_weight_figure(detail: pd.DataFrame) -> go.Figure:
+    """Horizontal bars of each stock's weight within the selected sector.
+
+    A single fixed categorical colour (not the GAIN/LOSS pair): this is a
+    weight comparison, not a P&L view - reusing GAIN_COLOR here would
+    wrongly imply "good" the way it does on the actual P&L bar charts.
+    """
+    dark = _is_dark_theme()
+    color = (CATEGORICAL_DARK if dark else CATEGORICAL_LIGHT)[0]
+    data = detail.dropna(subset=["pct_of_sector"]).sort_values("pct_of_sector")
+    fig = go.Figure(
+        go.Bar(
+            x=data["pct_of_sector"],
+            y=data["symbol"],
+            orientation="h",
+            marker={"color": color, "cornerradius": 4},
+            customdata=np.column_stack([
+                [fmt_inr(v) for v in data["current_value"]],
+                [fmt_pct_plain(v) for v in data["pct_of_portfolio"]],
+            ]),
+            hovertemplate=(
+                "<b>%{y}</b><br>% of sector: %{x:.2f}%<br>Value: %{customdata[0]}"
+                "<br>% of portfolio: %{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        height=max(360, 26 * len(data) + 80),
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        bargap=0.35,
+        xaxis={"title": "% of sector allocation", "ticksuffix": "%"},
+        yaxis={"title": None, "automargin": True},
+        showlegend=False,
+    )
+    return fig
 
 
 def mutual_fund_allocation_figure(mutual_funds: pd.DataFrame) -> go.Figure:
@@ -2736,7 +2794,8 @@ def render_tab_overview(
 
 
 def render_tab_sector(holdings: pd.DataFrame) -> None:
-    """Tab 2: sector allocation doughnut, HHI concentration risk, and a performance table."""
+    """Tab 2: sector allocation doughnut, HHI concentration risk, an interactive per-sector
+    performance table, and a drill-down into the selected sector's individual holdings."""
     sector_df = group_breakdown(holdings, "sector")
     all_uncategorized = (sector_df["sector"] == UNCATEGORIZED).all()
 
@@ -2766,7 +2825,97 @@ def render_tab_sector(holdings: pd.DataFrame) -> None:
             banner(f"**{risk}**")
 
     st.subheader("Sector Performance", anchor=False)
-    render_breakdown_table(sector_df, "sector", "Sector")
+    st.caption("Click a row, or use the dropdown below, to drill into that sector's holdings.")
+    table_selected = render_sector_summary_table(sector_df)
+    selected_sector = render_sector_selector(sector_df, table_selected)
+
+    st.divider()
+    render_sector_drilldown(holdings, selected_sector)
+
+
+def render_sector_summary_table(sector_df: pd.DataFrame) -> str | None:
+    """Interactive per-sector performance table.
+
+    Clicking a row selects that sector for the drill-down below. Returns
+    the clicked sector, or ``None`` if no row is selected yet - the caller
+    (:func:`render_sector_selector`) then defaults to the top sector by
+    value, per the existing sort order of ``sector_df``.
+    """
+    columns = {
+        "sector": "Sector", "holdings_count": "Stocks", "invested_value": "Invested",
+        "current_value": "Current Value", "unrealized_pnl": "P&L",
+        "unrealized_pnl_pct": "P&L %", "weight_pct": "Weight",
+    }
+    table = sector_df[list(columns)].rename(columns=columns).reset_index(drop=True)
+    styler = table.style.format(
+        {"Invested": INR_FORMAT, "Current Value": INR_FORMAT,
+         "P&L": lambda v: fmt_inr(v, signed=True), "P&L %": PCT_FORMAT, "Weight": "{:.2f}%"},
+        na_rep="—",
+    ).map(_pnl_color, subset=["P&L", "P&L %"])
+
+    event = st.dataframe(
+        styler, hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row", key="sector_table_select",
+    )
+    selected_rows = event.selection.rows if event and event.selection else []
+    return str(table.iloc[selected_rows[0]]["Sector"]) if selected_rows else None
+
+
+def render_sector_selector(sector_df: pd.DataFrame, table_selected: str | None) -> str:
+    """Sector to drill into: a table row click takes priority over the dropdown below it,
+    and is synced into the dropdown's own state so the two never show different sectors.
+    Defaults to the top sector by value (``sector_df`` is already sorted that way)."""
+    sectors = sector_df["sector"].tolist()
+    if table_selected in sectors:
+        st.session_state["sector_drilldown_choice"] = table_selected
+    current = st.session_state.get("sector_drilldown_choice", sectors[0])
+    if current not in sectors:
+        current = sectors[0]
+    return st.selectbox(
+        "Or pick a sector to drill down:", sectors,
+        index=sectors.index(current), key="sector_drilldown_choice",
+    )
+
+
+def render_sector_drilldown(holdings: pd.DataFrame, selected_sector: str) -> None:
+    """Per-stock detail for one sector: metric cards, a table and a weight-comparison chart."""
+    detail = compute_sector_drilldown(holdings, selected_sector)
+    st.markdown(f"### Sector Drill-Down: {selected_sector}")
+    if detail.empty:
+        st.caption("No holdings in this sector.")
+        return
+
+    total_value = float(detail["current_value"].sum())
+    total_invested = float(detail["invested_value"].sum())
+    pnl = total_value - total_invested
+    pnl_pct = pnl / total_invested * 100 if total_invested > 0 else None
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Total Sector Value", fmt_inr_compact(total_value), border=True,
+        help=fmt_inr(total_value),
+    )
+    c2.metric(
+        "Sector P&L (%)", fmt_pct(pnl_pct), delta=fmt_inr(pnl, signed=True), border=True,
+    )
+    c3.metric("Number of Holdings", f"{len(detail)} stock(s)", border=True)
+
+    columns = {
+        "symbol": "Symbol", "quantity": "Quantity", "average_price": "Avg. Price (₹)",
+        "ltp": "Current LTP (₹)", "current_value": "Current Value (₹)",
+        "unrealized_pnl": "Unrealized P&L (₹)", "unrealized_pnl_pct": "Unrealized P&L (%)",
+        "pct_of_sector": "% of Sector", "pct_of_portfolio": "% of Portfolio",
+    }
+    table = detail[list(columns)].rename(columns=columns)
+    styler = table.style.format(
+        {"Quantity": fmt_quantity, "Avg. Price (₹)": INR_FORMAT, "Current LTP (₹)": INR_FORMAT,
+         "Current Value (₹)": INR_FORMAT, "Unrealized P&L (₹)": lambda v: fmt_inr(v, signed=True),
+         "Unrealized P&L (%)": PCT_FORMAT, "% of Sector": "{:.2f}%", "% of Portfolio": "{:.2f}%"},
+        na_rep="—",
+    ).map(_pnl_color, subset=["Unrealized P&L (₹)", "Unrealized P&L (%)"])
+    st.dataframe(styler, hide_index=True, width="stretch")
+
+    st.plotly_chart(sector_drilldown_weight_figure(detail), width="stretch")
 
 
 def render_tab_marketcap(holdings: pd.DataFrame) -> None:
