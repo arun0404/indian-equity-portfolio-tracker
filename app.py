@@ -1327,6 +1327,90 @@ def enrich_sector_and_cap(holdings: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Dividend & corporate-actions data
+# ---------------------------------------------------------------------------
+
+DIVIDEND_LOOKBACK_YEARS = 1  # trailing-twelve-months window for yield/income projections
+
+
+def _fetch_one_dividend_history(ticker: str) -> tuple[str, pd.Series]:
+    """Full per-share dividend history for one ticker; an empty Series on any failure.
+
+    Yahoo returns the same empty (not missing/error) result for a stock that
+    has simply never paid a dividend as for a lookup failure - there is no
+    way to tell the two apart from this call alone, so both are treated the
+    same way: no dividend rows, no exception.
+    """
+    try:
+        dividends = yf.Ticker(ticker).dividends
+    except Exception:
+        return ticker, pd.Series(dtype=float)
+    if dividends is None or dividends.empty:
+        return ticker, pd.Series(dtype=float)
+    dividends = dividends.copy()
+    # Yahoo's index is tz-aware (Asia/Kolkata); the rest of the app is naive.
+    dividends.index = pd.DatetimeIndex(dividends.index).tz_localize(None)
+    return ticker, dividends
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def fetch_dividend_history(tickers: tuple[str, ...]) -> pd.DataFrame:
+    """Historical per-share dividend payouts for every ticker, from Yahoo Finance.
+
+    Cached a day (a dividend calendar changes rarely) and threaded like
+    :func:`fetch_sector_and_marketcap`; a ticker with no history (an ETF, a
+    non-payer) or a fetch failure simply contributes no rows, never raises.
+
+    Returns:
+        One row per historical payout across all tickers: ``ticker``,
+        ``ex_dividend_date``, ``dividend_per_share``. Empty (with these
+        columns) if nothing was found for any ticker.
+    """
+    columns = ["ticker", "ex_dividend_date", "dividend_per_share"]
+    if yf is None or not tickers:
+        return pd.DataFrame(columns=columns)
+    frames: list[pd.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ticker, dividends in pool.map(_fetch_one_dividend_history, tickers):
+            if dividends.empty:
+                continue
+            frames.append(pd.DataFrame({
+                "ticker": ticker, "ex_dividend_date": dividends.index,
+                "dividend_per_share": dividends.to_numpy(dtype=float),
+            }))
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)
+
+
+def enrich_dividend_metrics(
+    holdings: pd.DataFrame, dividend_history: pd.DataFrame, as_of: pd.Timestamp
+) -> pd.DataFrame:
+    """Attach trailing-twelve-month dividend/share, forward yield and estimated annual
+    income to holdings - needs only current holdings, not trade history (unlike realised
+    dividends, which need a purchase date - see :func:`compute_realized_dividend_events`).
+
+    A stock with nothing paid in the trailing year gets ``0``, not ``NaN``: "no dividend"
+    is a real, valid answer here, not missing data.
+    """
+    df = holdings.copy()
+    if dividend_history.empty:
+        ttm = pd.Series(0.0, index=df.index)
+    else:
+        window_start = as_of - pd.DateOffset(years=DIVIDEND_LOOKBACK_YEARS)
+        recent = dividend_history[
+            dividend_history["ex_dividend_date"].gt(window_start)
+            & dividend_history["ex_dividend_date"].le(as_of)
+        ]
+        ttm_by_ticker = recent.groupby("ticker")["dividend_per_share"].sum()
+        ttm = df["ticker"].map(ttm_by_ticker).fillna(0.0)
+    df["ttm_dividend_per_share"] = ttm
+    df["dividend_yield_pct"] = np.where(df["ltp"] > 0, ttm / df["ltp"] * 100, np.nan)
+    df["estimated_annual_dividend"] = df["quantity"] * ttm
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Financial metrics
 # ---------------------------------------------------------------------------
 
@@ -1840,6 +1924,96 @@ def suggest_tax_loss_harvesting(
     )
 
 
+def compute_realized_dividend_events(
+    trades: pd.DataFrame, dividend_history: pd.DataFrame, as_of: pd.Timestamp
+) -> pd.DataFrame:
+    """Dividends actually received on currently-held lots since each lot's own purchase date.
+
+    Reuses the same FIFO tax-lot pipeline as the Tax tab (:func:`compute_tax_lots`), so a
+    lot bought after a dividend's ex-date correctly never counts that dividend - a blended
+    average purchase date (as :func:`clean_holdings` computes for display) would get this
+    wrong for a stock bought in more than one lot.
+
+    Returns:
+        One row per (held lot, matching dividend payment): ``symbol``,
+        ``ex_dividend_date``, ``amount_received``. Empty (with these columns)
+        without trade history, without dividend history, or if nothing matches.
+    """
+    columns = ["symbol", "ex_dividend_date", "amount_received"]
+    if trades.empty or dividend_history.empty:
+        return pd.DataFrame(columns=columns)
+    lots = compute_tax_lots(trades, as_of)
+    if lots.empty:
+        return pd.DataFrame(columns=columns)
+    ticker_by_symbol = trades.drop_duplicates("symbol").set_index("symbol")["ticker"]
+    lots = lots.assign(ticker=lots["symbol"].map(ticker_by_symbol))
+
+    events: list[pd.DataFrame] = []
+    for lot in lots.itertuples():
+        paid = dividend_history[
+            dividend_history["ticker"].eq(lot.ticker)
+            & dividend_history["ex_dividend_date"].ge(lot.purchase_date)
+            & dividend_history["ex_dividend_date"].le(as_of)
+        ]
+        if paid.empty:
+            continue
+        events.append(pd.DataFrame({
+            "symbol": lot.symbol, "ex_dividend_date": paid["ex_dividend_date"].to_numpy(),
+            "amount_received": paid["dividend_per_share"].to_numpy() * lot.quantity,
+        }))
+    if not events:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(events, ignore_index=True)
+
+
+@dataclass(frozen=True)
+class DividendMetrics:
+    """Portfolio-level dividend income figures."""
+
+    total_realized: float | None  # None when there is no trade history to compute it from
+    estimated_annual_income: float
+    portfolio_yield_pct: float | None  # current-value-weighted; None if current value is 0
+    top_payer_symbol: str | None
+    top_payer_annual: float
+
+
+def compute_dividend_metrics(
+    holdings_with_dividends: pd.DataFrame, realized_events: pd.DataFrame | None
+) -> DividendMetrics:
+    """Aggregate per-stock dividend figures into portfolio-level totals.
+
+    ``realized_events`` is ``None`` (as opposed to merely empty) specifically to mean "no
+    trade history was uploaded, so realised dividends cannot be computed at all" -
+    distinct from "trade history exists but no dividends were realised" (a genuine ₹0),
+    which is an empty-but-not-``None`` DataFrame. Callers must preserve that distinction.
+    """
+    total_current_value = float(holdings_with_dividends["current_value"].sum())
+    portfolio_yield = None
+    if total_current_value > 0:
+        weighted = holdings_with_dividends["dividend_yield_pct"].fillna(0.0)
+        portfolio_yield = float(
+            (weighted * holdings_with_dividends["current_value"]).sum() / total_current_value
+        )
+
+    total_realized = None
+    if realized_events is not None:
+        total_realized = float(realized_events["amount_received"].sum())
+
+    top_symbol, top_annual = None, 0.0
+    payers = holdings_with_dividends[holdings_with_dividends["estimated_annual_dividend"] > 0]
+    if not payers.empty:
+        top_row = payers.loc[payers["estimated_annual_dividend"].idxmax()]
+        top_symbol, top_annual = str(top_row["symbol"]), float(top_row["estimated_annual_dividend"])
+
+    return DividendMetrics(
+        total_realized=total_realized,
+        estimated_annual_income=float(holdings_with_dividends["estimated_annual_dividend"].sum()),
+        portfolio_yield_pct=portfolio_yield,
+        top_payer_symbol=top_symbol,
+        top_payer_annual=top_annual,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -1877,6 +2051,11 @@ def fmt_inr_compact(value: float | None, signed: bool = False) -> str:
 def fmt_pct(value: float | None) -> str:
     """Format a percentage with an explicit sign, e.g. ``+12.34%``."""
     return PCT_FORMAT.format(value) if _is_finite(value) else "N/A"
+
+
+def fmt_pct_plain(value: float | None) -> str:
+    """Format a non-directional percentage with no sign, e.g. a yield: ``3.50%``."""
+    return f"{value:.2f}%" if _is_finite(value) else "N/A"
 
 
 def fmt_quantity(value: float) -> str:
@@ -2042,6 +2221,66 @@ def pnl_bar_figure(holdings: pd.DataFrame) -> go.Figure:
         bargap=0.35,
         xaxis={"title": "Unrealised return", "ticksuffix": "%", "zeroline": True,
                "zerolinewidth": 1},
+        yaxis={"title": None, "automargin": True},
+        showlegend=False,
+    )
+    return fig
+
+
+def dividend_income_by_month_figure(realized_events: pd.DataFrame) -> go.Figure:
+    """Vertical bars of realised dividend cash flow, summed by calendar month."""
+    monthly = (
+        realized_events.assign(
+            month=realized_events["ex_dividend_date"].dt.to_period("M").dt.to_timestamp()
+        )
+        .groupby("month", as_index=False)["amount_received"].sum()
+        .sort_values("month")
+    )
+    fig = go.Figure(
+        go.Bar(
+            x=monthly["month"],
+            y=monthly["amount_received"],
+            marker={"color": GAIN_COLOR, "cornerradius": 4},
+            customdata=[fmt_inr(v) for v in monthly["amount_received"]],
+            hovertemplate="<b>%{x|%b %Y}</b><br>%{customdata}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=360,
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        bargap=0.25,
+        xaxis={"title": None, "tickformat": "%b %Y"},
+        yaxis={"title": "Dividends received", "tickprefix": "₹", "rangemode": "tozero"},
+        showlegend=False,
+    )
+    return fig
+
+
+def dividend_contributors_figure(holdings_with_dividends: pd.DataFrame) -> go.Figure:
+    """Horizontal bars of estimated annual dividend income, top contributors first."""
+    data = holdings_with_dividends[holdings_with_dividends["estimated_annual_dividend"] > 0]
+    data = data.sort_values("estimated_annual_dividend")
+    fig = go.Figure(
+        go.Bar(
+            x=data["estimated_annual_dividend"],
+            y=data["symbol"],
+            orientation="h",
+            marker={"color": GAIN_COLOR, "cornerradius": 4},
+            customdata=np.column_stack([
+                [fmt_pct(v) for v in data["dividend_yield_pct"]],
+                [fmt_inr(v) for v in data["ttm_dividend_per_share"]],
+            ]),
+            hovertemplate=(
+                "<b>%{y}</b><br>Est. annual: %{x:,.0f}<br>Yield: %{customdata[0]}"
+                "<br>TTM/share: %{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        height=max(360, 26 * len(data) + 80),
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        bargap=0.35,
+        xaxis={"title": "Estimated annual dividend", "tickprefix": "₹"},
         yaxis={"title": None, "automargin": True},
         showlegend=False,
     )
@@ -2246,9 +2485,11 @@ def resolve_mf_navs(mutual_funds: pd.DataFrame, use_live: bool) -> tuple[dict[st
     return live_navs, f"{found}/{len(isins)} NAVs live from AMFI (mfapi.in)."
 
 
-def render_metrics(metrics: PortfolioMetrics, as_of: pd.Timestamp) -> None:
+def render_metrics(
+    metrics: PortfolioMetrics, as_of: pd.Timestamp, estimated_annual_dividend: float
+) -> None:
     """Top row of executive metric cards."""
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric(
         "Total Current Value", fmt_inr_compact(metrics.total_current),
         delta=fmt_inr(metrics.net_pnl, signed=True), border=True,
@@ -2286,6 +2527,12 @@ def render_metrics(metrics: PortfolioMetrics, as_of: pd.Timestamp) -> None:
         if years < 1:
             cagr_help += " Periods under a year are annualised (extrapolated)."
     c5.metric("Portfolio CAGR (%)", fmt_pct(metrics.cagr_pct), border=True, help=cagr_help)
+    c6.metric(
+        "Est. Annual Dividends", fmt_inr_compact(estimated_annual_dividend), border=True,
+        help=f"{fmt_inr(estimated_annual_dividend)}/year, projected from each holding's "
+             "trailing-twelve-month dividend per share at current quantities - see the "
+             "Dividends & Corporate Actions tab for the per-stock breakdown.",
+    )
 
     if metrics.xirr_method == "fallback":
         st.caption("\\* XIRR did not converge for these cash flows; showing net P&L % instead.")
@@ -2475,10 +2722,10 @@ def render_trades_table(trades: pd.DataFrame) -> None:
 
 def render_tab_overview(
     metrics: PortfolioMetrics, holdings: pd.DataFrame, trades: pd.DataFrame | None,
-    as_of: pd.Timestamp,
+    dividend_metrics: DividendMetrics, as_of: pd.Timestamp,
 ) -> None:
     """Tab 1: top metrics, benchmark alpha, performance split, movers and allocation charts."""
-    render_metrics(metrics, as_of)
+    render_metrics(metrics, as_of, dividend_metrics.estimated_annual_income)
     render_benchmark_comparison(trades, as_of, metrics)
     st.divider()
     render_performance_split(holdings)
@@ -2645,6 +2892,90 @@ def render_loss_harvesting(priced_lots: pd.DataFrame, estimate: CapitalGainsEsti
     st.dataframe(styler, hide_index=True, width="stretch")
 
 
+def render_tab_dividends(
+    holdings_with_dividends: pd.DataFrame, realized_events: pd.DataFrame,
+    dividend_metrics: DividendMetrics, has_trades: bool,
+) -> None:
+    """Tab 5: dividend income summary, realised cash flow, top contributors and a table."""
+    c1, c2, c3, c4 = st.columns(4)
+    if not has_trades:
+        realized_display, realized_help = (
+            "N/A", "Upload a Trade History / P&L report to compute realised dividends.",
+        )
+    else:
+        realized_display = fmt_inr_compact(dividend_metrics.total_realized)
+        realized_help = (f"{fmt_inr(dividend_metrics.total_realized)} received on currently "
+                          "held lots since each lot's own purchase date.")
+    c1.metric("Total Realized Dividends", realized_display, border=True, help=realized_help)
+    c2.metric(
+        "Est. Annual Passive Income", fmt_inr_compact(dividend_metrics.estimated_annual_income),
+        border=True,
+        help=f"{fmt_inr(dividend_metrics.estimated_annual_income)}/year at current holdings "
+             "and trailing-twelve-month dividend rates.",
+    )
+    c3.metric(
+        "Portfolio Dividend Yield", fmt_pct_plain(dividend_metrics.portfolio_yield_pct),
+        border=True,
+        help="Trailing-twelve-month dividend yield, weighted by each holding's current value.",
+    )
+    c4.metric(
+        "Top Dividend Payer", dividend_metrics.top_payer_symbol or "—", border=True,
+        help=(f"Estimated annual dividend {fmt_inr(dividend_metrics.top_payer_annual)}."
+              if dividend_metrics.top_payer_symbol else "No dividend-paying holdings found."),
+    )
+
+    if (holdings_with_dividends["estimated_annual_dividend"] <= 0).all():
+        st.info(
+            "No dividend history found for any holding - either none of these stocks paid a "
+            "dividend in the trailing year, or Yahoo Finance was unreachable.",
+            icon=":material/info:",
+        )
+        return
+
+    st.divider()
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader("Monthly Dividend Income (Realised)", anchor=False)
+        if not has_trades:
+            st.caption("Upload a Trade History / P&L report to see realised dividend cash "
+                       "flow by month.")
+        elif realized_events.empty:
+            st.caption("No realised dividends matched to your currently held lots yet.")
+        else:
+            st.plotly_chart(dividend_income_by_month_figure(realized_events), width="stretch")
+    with right:
+        st.subheader("Top Dividend Contributors (Est. Annual)", anchor=False)
+        st.plotly_chart(dividend_contributors_figure(holdings_with_dividends), width="stretch")
+
+    st.subheader("Dividend Details", anchor=False)
+    realized_by_symbol = (
+        realized_events.groupby("symbol")["amount_received"].sum()
+        if has_trades and not realized_events.empty else pd.Series(dtype=float)
+    )
+    table_df = holdings_with_dividends.copy()
+    table_df["total_realized_dividend"] = (
+        table_df["symbol"].map(realized_by_symbol) if has_trades else np.nan
+    )
+    columns = {
+        "symbol": "Stock", "quantity": "Shares Held", "ltp": "Current LTP",
+        "ttm_dividend_per_share": "TTM Dividend/Share", "dividend_yield_pct": "Dividend Yield %",
+        "estimated_annual_dividend": "Est. Annual Dividend (₹)",
+        "total_realized_dividend": "Total Realized Dividend (₹)",
+    }
+    table = (
+        table_df.sort_values("estimated_annual_dividend", ascending=False)[list(columns)]
+        .rename(columns=columns)
+        .reset_index(drop=True)
+    )
+    styler = table.style.format(
+        {"Shares Held": fmt_quantity, "Current LTP": INR_FORMAT,
+         "TTM Dividend/Share": INR_FORMAT, "Dividend Yield %": "{:.2f}%",
+         "Est. Annual Dividend (₹)": INR_FORMAT, "Total Realized Dividend (₹)": INR_FORMAT},
+        na_rep="—",
+    )
+    st.dataframe(styler, hide_index=True, width="stretch")
+
+
 def render_tab_mutual_funds(mutual_funds: pd.DataFrame, use_live: bool) -> None:
     """Tab 6: mutual fund holdings, parsed from a Mutual Fund sheet in the same file."""
     if mutual_funds.empty:
@@ -2780,21 +3111,39 @@ def main() -> None:
     enriched = enrich_sector_and_cap(enriched)
     metrics = compute_portfolio_metrics(enriched, trades, as_of)
 
+    dividend_history = fetch_dividend_history(tuple(sorted(enriched["ticker"].unique())))
+    holdings_with_dividends = enrich_dividend_metrics(enriched, dividend_history, as_of)
+    has_trades = trades is not None and not trades.empty
+    realized_events = (
+        compute_realized_dividend_events(trades, dividend_history, as_of) if has_trades
+        else pd.DataFrame(columns=["symbol", "ex_dividend_date", "amount_received"])
+    )
+    dividend_metrics = compute_dividend_metrics(
+        holdings_with_dividends, realized_events if has_trades else None
+    )
+    if not enriched.empty and dividend_history.empty:
+        notes.append(
+            "Dividends: no dividend data found for any holding (offline, rate-limited, "
+            "or none of these stocks pay dividends)."
+        )
+
     st.caption(price_status)
     render_data_warnings(enriched, trades, notes, controls.use_live_prices)
 
-    tab_overview, tab_sector, tab_cap, tab_tax, tab_mf, tab_all = st.tabs([
+    tab_overview, tab_sector, tab_cap, tab_tax, tab_div, tab_mf, tab_all = st.tabs([
         "Overview & Top Metrics", "Sector Breakdown", "Market Cap Breakdown",
-        "Tax & Holding Period", "Mutual Funds", "All Holdings",
+        "Tax & Holding Period", "Dividends & Corporate Actions", "Mutual Funds", "All Holdings",
     ])
     with tab_overview:
-        render_tab_overview(metrics, enriched, trades, as_of)
+        render_tab_overview(metrics, enriched, trades, dividend_metrics, as_of)
     with tab_sector:
         render_tab_sector(enriched)
     with tab_cap:
         render_tab_marketcap(enriched)
     with tab_tax:
         render_tab_tax(enriched, trades, as_of)
+    with tab_div:
+        render_tab_dividends(holdings_with_dividends, realized_events, dividend_metrics, has_trades)
     with tab_mf:
         render_tab_mutual_funds(mutual_funds, controls.use_live_prices)
     with tab_all:
