@@ -28,6 +28,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from scipy import optimize
 
@@ -1126,11 +1127,90 @@ def enrich_holdings(holdings: pd.DataFrame, live_prices: Mapping[str, float]) ->
     return df
 
 
-def enrich_mutual_funds(mutual_funds: pd.DataFrame) -> pd.DataFrame:
+AMFI_SCHEME_LIST_URL = "https://api.mfapi.in/mf"
+AMFI_SCHEME_NAV_URL = "https://api.mfapi.in/mf/{code}"
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def fetch_amfi_scheme_isin_map() -> dict[str, int]:
+    """ISIN -> AMFI scheme code, from mfapi.in's full scheme list.
+
+    Cached a day: this master list changes rarely (new scheme launches), and
+    NAVs themselves only update once per business day, so there is nothing
+    to gain from fetching it more often. A request failure yields an empty
+    map rather than raising - live NAV lookup then simply finds nothing and
+    every fund falls back to the NAV already in the uploaded file.
+    """
+    try:
+        response = requests.get(AMFI_SCHEME_LIST_URL, timeout=15)
+        response.raise_for_status()
+        schemes = response.json()
+    except Exception:
+        return {}
+    mapping: dict[str, int] = {}
+    for scheme in schemes:
+        code = scheme.get("schemeCode")
+        if not code:
+            continue
+        for isin in (scheme.get("isinGrowth"), scheme.get("isinDivReinvestment")):
+            if isin:
+                mapping.setdefault(isin, code)
+    return mapping
+
+
+def _fetch_one_amfi_nav(scheme_code: int) -> tuple[int, float | None]:
+    """Latest NAV for one AMFI scheme code; ``None`` on any failure."""
+    try:
+        response = requests.get(AMFI_SCHEME_NAV_URL.format(code=scheme_code), timeout=15)
+        response.raise_for_status()
+        nav = float(response.json()["data"][0]["nav"])
+    except Exception:
+        return scheme_code, None
+    return scheme_code, (nav if nav > 0 else None)
+
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_live_mf_navs(isins: tuple[str, ...]) -> dict[str, float]:
+    """Latest NAV per ISIN from AMFI (via mfapi.in), threaded and cached 5 minutes.
+
+    Mirrors :func:`fetch_live_prices` for equities: a per-ISIN failure (fund
+    not found, request error) is dropped silently rather than raised, so one
+    bad ISIN never blocks the rest of the batch.
+    """
+    if not isins:
+        return {}
+    isin_to_code = fetch_amfi_scheme_isin_map()
+    codes = {isin: isin_to_code[isin] for isin in isins if isin in isin_to_code}
+    if not codes:
+        return {}
+    navs_by_code: dict[int, float] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for code, nav in pool.map(_fetch_one_amfi_nav, set(codes.values())):
+            if nav is not None:
+                navs_by_code[code] = nav
+    return {isin: navs_by_code[code] for isin, code in codes.items() if code in navs_by_code}
+
+
+def enrich_mutual_funds(
+    mutual_funds: pd.DataFrame, live_navs: Mapping[str, float] | None = None
+) -> pd.DataFrame:
     """Compute per-fund P&L and portfolio weight (the mutual-fund analogue of
-    :func:`enrich_holdings` - no live-price step, since Yahoo Finance doesn't
-    carry Indian mutual fund NAVs; the file's own NAV/value is used as-is)."""
+    :func:`enrich_holdings`).
+
+    NAV precedence: live AMFI NAV (by ISIN, via :func:`fetch_live_mf_navs`) ->
+    the NAV already in the uploaded file, flagged via ``nav_source`` the same
+    way equities flag ``price_source``. ``live_navs`` defaults to empty (file
+    NAV only) so callers that don't care about live data can omit it.
+    """
     df = mutual_funds.copy()
+    if df.empty:
+        df["nav_source"] = pd.Series(dtype=object)
+        return df
+    live = df["isin"].map(live_navs or {}).astype(float)
+    df["nav_source"] = np.where(live.notna(), "Live", "File")
+    df["current_nav"] = live.fillna(df["current_nav"])
+    df["current_value"] = df["units"] * df["current_nav"]
+
     df["unrealized_pnl"] = df["current_value"] - df["invested_value"]
     invested = df["invested_value"].where(df["invested_value"] > 0)
     df["unrealized_pnl_pct"] = df["unrealized_pnl"] / invested * 100
@@ -1417,6 +1497,93 @@ def compute_portfolio_metrics(
     )
 
 
+BENCHMARK_TICKER = "^NSEI"  # NIFTY 50
+
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_benchmark_series(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    """Daily close prices for the benchmark index from ``start`` to ``end`` (inclusive).
+
+    Cached like :func:`fetch_live_prices`; an empty result on any failure
+    (network, no data for the range) rather than raising, so a benchmark
+    outage degrades to "no alpha available", not a crashed page.
+    """
+    if yf is None:
+        return pd.Series(dtype=float)
+    try:
+        data = yf.download(
+            BENCHMARK_TICKER, start=start, end=end + pd.Timedelta(days=1),
+            interval="1d", auto_adjust=False, progress=False,
+        )
+    except Exception:
+        return pd.Series(dtype=float)
+    if data is None or data.empty or "Close" not in data.columns.get_level_values(0):
+        return pd.Series(dtype=float)
+    closes = data["Close"]
+    if isinstance(closes, pd.DataFrame):
+        closes = closes.iloc[:, 0]
+    return pd.to_numeric(closes, errors="coerce").dropna()
+
+
+def _price_on_or_before(series: pd.Series, when: pd.Timestamp) -> float | None:
+    """Latest available price at or before ``when`` (handles weekends/holidays)."""
+    eligible = series[series.index <= when]
+    return float(eligible.iloc[-1]) if not eligible.empty else None
+
+
+@dataclass(frozen=True)
+class BenchmarkComparison:
+    """Portfolio XIRR vs. an identical-cash-flow investment in the benchmark index."""
+
+    benchmark_name: str
+    benchmark_xirr_pct: float
+    alpha_pct: float  # portfolio XIRR - benchmark XIRR
+
+
+def compute_benchmark_alpha(
+    trades: pd.DataFrame, as_of: pd.Timestamp, portfolio_xirr_pct: float
+) -> BenchmarkComparison | None:
+    """Alpha = portfolio XIRR minus a benchmark XIRR built from the *same* cash flows.
+
+    For a fair comparison, every trade's rupee amount is hypothetically
+    invested in (a BUY) or withdrawn from (a SELL) the benchmark index on
+    that same date, at that day's close (or the last trading day at/before
+    it, for a weekend/holiday). The resulting benchmark units, valued at the
+    latest available close, become the terminal value for a ``solve_xirr``
+    call on the same dated cash flows - giving a benchmark XIRR directly
+    comparable to the portfolio's, rather than mixing a CAGR-basis benchmark
+    return with an XIRR-basis portfolio return.
+
+    Returns ``None`` when there isn't enough data for a fair comparison
+    (benchmark data unavailable, no valid trades, or the equivalent
+    benchmark investment nets to zero or negative units).
+    """
+    series = fetch_benchmark_series(trades["date"].min(), as_of)
+    if series.empty:
+        return None
+
+    units = 0.0
+    for row in trades.itertuples():
+        price = _price_on_or_before(series, row.date)
+        if price is None or price <= 0:
+            continue
+        amount = row.quantity * row.price
+        units += amount / price if row.type == "BUY" else -amount / price
+    if units <= 0:
+        return None
+
+    benchmark_value = units * float(series.iloc[-1])
+    rate = solve_xirr([*trades["date"], as_of], [*trades["cash_flow"], benchmark_value])
+    if rate is None:
+        return None
+    benchmark_xirr_pct = rate * 100
+    return BenchmarkComparison(
+        benchmark_name="NIFTY 50",
+        benchmark_xirr_pct=benchmark_xirr_pct,
+        alpha_pct=portfolio_xirr_pct - benchmark_xirr_pct,
+    )
+
+
 @dataclass(frozen=True)
 class MutualFundMetrics:
     """Portfolio-level mutual fund numbers (percentages are in percent, not fractions)."""
@@ -1619,6 +1786,57 @@ def estimate_capital_gains(priced_lots: pd.DataFrame) -> CapitalGainsEstimate:
         ltcg_gain=ltcg_gain,
         ltcg_taxable=ltcg_taxable,
         ltcg_tax=ltcg_taxable * LTCG_TAX_RATE,
+    )
+
+
+@dataclass(frozen=True)
+class TaxLossHarvestingSuggestion:
+    """Loss-making lots and the tax saved by realising them to offset gains."""
+
+    loss_lots: pd.DataFrame
+    total_harvestable_loss: float
+    current_tax: float
+    harvested_tax: float
+    potential_savings: float
+
+
+def suggest_tax_loss_harvesting(
+    priced_lots: pd.DataFrame, baseline: CapitalGainsEstimate
+) -> TaxLossHarvestingSuggestion:
+    """Loss-making lots, and the tax saved by realising them to offset gains.
+
+    Models "sell every lot today", the same framing :func:`estimate_capital_gains`
+    already uses: within each term, gains and losses there already net against
+    each other. The one thing that function deliberately doesn't do - because
+    it requires actually *selling* to be tax-law-valid, not just holding a
+    paper loss - is let a net Short-Term loss spill over to offset a
+    Long-Term gain (Indian tax law allows this one-directional carry; a
+    Long-Term loss can only ever offset LTCG, never STCG, so no such branch
+    exists here). This computes that "what if you actually harvested"
+    scenario as an explicit comparison against the baseline, rather than
+    silently changing it - the base tax estimate elsewhere in the app is
+    unaffected by this function.
+    """
+    if priced_lots.empty:
+        return TaxLossHarvestingSuggestion(priced_lots, 0.0, 0.0, 0.0, 0.0)
+
+    loss_lots = priced_lots[priced_lots["unrealized_gain"] < 0].sort_values("unrealized_gain")
+    total_harvestable_loss = float(-loss_lots["unrealized_gain"].sum())
+
+    short_term, long_term = baseline.stcg_gain, baseline.ltcg_gain
+    if short_term < 0:
+        long_term += short_term  # net ST loss offsets LT gain - never the reverse
+        short_term = 0.0
+    short_taxable = max(0.0, short_term)
+    long_taxable = max(0.0, long_term - LTCG_EXEMPTION)
+    harvested_tax = short_taxable * STCG_TAX_RATE + long_taxable * LTCG_TAX_RATE
+    current_tax = baseline.stcg_tax + baseline.ltcg_tax
+    return TaxLossHarvestingSuggestion(
+        loss_lots=loss_lots,
+        total_harvestable_loss=total_harvestable_loss,
+        current_tax=current_tax,
+        harvested_tax=harvested_tax,
+        potential_savings=current_tax - harvested_tax,
     )
 
 
@@ -2004,6 +2222,30 @@ def resolve_prices(
     )
 
 
+def resolve_mf_navs(mutual_funds: pd.DataFrame, use_live: bool) -> tuple[dict[str, float], str]:
+    """Fetch live AMFI NAVs if enabled; returns ``(live_navs by ISIN, status caption)``.
+
+    Mirrors :func:`resolve_prices`'s shape for equities, but there is no
+    ticker/symbol to correct here, so only the NAV map and a status string
+    are returned - the caller applies it via :func:`enrich_mutual_funds`.
+    """
+    if mutual_funds.empty:
+        return {}, ""
+    if not use_live:
+        return {}, "Live NAVs off - using the NAV from the file."
+
+    isins = tuple(sorted(set(mutual_funds.loc[mutual_funds["isin"] != "", "isin"])))
+    if not isins:
+        return {}, "No ISIN in the file for these funds - using the NAV from the file."
+
+    with st.spinner("Fetching live NAVs from AMFI..."):
+        live_navs = fetch_live_mf_navs(isins)
+    found = sum(isin in live_navs for isin in isins)
+    if not found:
+        return {}, "No live NAVs found on AMFI - using the NAV from the file."
+    return live_navs, f"{found}/{len(isins)} NAVs live from AMFI (mfapi.in)."
+
+
 def render_metrics(metrics: PortfolioMetrics, as_of: pd.Timestamp) -> None:
     """Top row of executive metric cards."""
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -2086,6 +2328,34 @@ def render_performance_split(holdings: pd.DataFrame) -> None:
         "Loss-Making Holdings (Red)", f"{len(lossmaking)} stock(s)",
         delta=fmt_inr_compact(lossmaking["unrealized_pnl"].sum(), signed=True), border=True,
         help=f"Total unrealised loss: {fmt_inr(lossmaking['unrealized_pnl'].sum())}.",
+    )
+
+
+def render_benchmark_comparison(
+    trades: pd.DataFrame | None, as_of: pd.Timestamp, metrics: PortfolioMetrics
+) -> None:
+    """NIFTY 50 XIRR and Alpha - silently omitted without a genuine solved portfolio XIRR
+    (no trade history, or the solver fell back), since comparing a fallback net-P&L%
+    figure against a real benchmark XIRR would be comparing two different things."""
+    if trades is None or trades.empty or metrics.xirr_method != "xirr" or metrics.xirr_pct is None:
+        return
+    comparison = compute_benchmark_alpha(trades, as_of, metrics.xirr_pct)
+    if comparison is None:
+        return
+
+    st.subheader("Benchmark Comparison", anchor=False)
+    c1, c2 = st.columns(2)
+    c1.metric(
+        f"{comparison.benchmark_name} XIRR (%)", fmt_pct(comparison.benchmark_xirr_pct),
+        border=True,
+        help=(f"What the same rupee amounts, invested in {comparison.benchmark_name} on the "
+              "same dates as your actual trades, would be worth today - a like-for-like "
+              "comparison, not just the index's own price return."),
+    )
+    c2.metric(
+        "Alpha vs. Benchmark (%)", fmt_pct(comparison.alpha_pct), border=True,
+        help=f"Portfolio XIRR minus the {comparison.benchmark_name} XIRR above. Positive means "
+             "you beat the benchmark on a same-cash-flow-timing basis.",
     )
 
 
@@ -2204,10 +2474,12 @@ def render_trades_table(trades: pd.DataFrame) -> None:
 
 
 def render_tab_overview(
-    metrics: PortfolioMetrics, holdings: pd.DataFrame, as_of: pd.Timestamp
+    metrics: PortfolioMetrics, holdings: pd.DataFrame, trades: pd.DataFrame | None,
+    as_of: pd.Timestamp,
 ) -> None:
-    """Tab 1: top metric cards, profitable-vs-loss split, top movers and allocation charts."""
+    """Tab 1: top metrics, benchmark alpha, performance split, movers and allocation charts."""
     render_metrics(metrics, as_of)
+    render_benchmark_comparison(trades, as_of, metrics)
     st.divider()
     render_performance_split(holdings)
     st.divider()
@@ -2327,10 +2599,53 @@ def render_tab_tax(
         na_rep="—",
     ).map(_pnl_color, subset=["Unrealised Gain"])
     st.dataframe(styler, hide_index=True, width="stretch")
+
+    render_loss_harvesting(priced_lots, estimate)
     render_trades_table(trades)
 
 
-def render_tab_mutual_funds(mutual_funds: pd.DataFrame) -> None:
+def render_loss_harvesting(priced_lots: pd.DataFrame, estimate: CapitalGainsEstimate) -> None:
+    """Tax Loss Harvesting section: loss-making lots and the tax saved by realising them."""
+    st.subheader("Tax Loss Harvesting Opportunities", anchor=False)
+    suggestion = suggest_tax_loss_harvesting(priced_lots, estimate)
+    if suggestion.loss_lots.empty:
+        st.caption("No loss-making positions to harvest right now.")
+        return
+
+    c1, c2 = st.columns(2)
+    c1.metric(
+        "Harvestable Loss", fmt_inr_compact(suggestion.total_harvestable_loss), border=True,
+        help=f"Total unrealised loss across {len(suggestion.loss_lots)} lot(s) if sold today.",
+    )
+    c2.metric(
+        "Potential Tax Savings", fmt_inr_compact(suggestion.potential_savings), border=True,
+        help=(f"Estimated tax drops from {fmt_inr(suggestion.current_tax)} to "
+              f"{fmt_inr(suggestion.harvested_tax)} if these losses are realised: a "
+              "Short-Term loss can offset both STCG and LTCG gains; a Long-Term loss can "
+              "only offset LTCG (never a Short-Term gain)."),
+    )
+    st.caption(
+        "Shows what selling these loss-making lots today, and using the loss to offset your "
+        "gains above, would save versus the baseline estimate - not a recommendation to sell. "
+        "India has no wash-sale rule, but rebuying resets that lot's holding period from "
+        "scratch, so a long-term position bought back becomes short-term again."
+    )
+    columns = {
+        "symbol": "Symbol", "purchase_date": "Purchase Date", "quantity": "Qty",
+        "term": "Term", "invested_value": "Invested", "current_value": "Current Value",
+        "unrealized_gain": "Unrealised Loss",
+    }
+    table = suggestion.loss_lots[list(columns)].rename(columns=columns).reset_index(drop=True)
+    styler = table.style.format(
+        {"Purchase Date": "{:%d %b %Y}", "Qty": fmt_quantity,
+         "Invested": INR_FORMAT, "Current Value": INR_FORMAT,
+         "Unrealised Loss": lambda v: fmt_inr(v, signed=True)},
+        na_rep="—",
+    ).map(_pnl_color, subset=["Unrealised Loss"])
+    st.dataframe(styler, hide_index=True, width="stretch")
+
+
+def render_tab_mutual_funds(mutual_funds: pd.DataFrame, use_live: bool) -> None:
     """Tab 6: mutual fund holdings, parsed from a Mutual Fund sheet in the same file."""
     if mutual_funds.empty:
         st.info(
@@ -2341,8 +2656,15 @@ def render_tab_mutual_funds(mutual_funds: pd.DataFrame) -> None:
         )
         return
 
-    enriched = enrich_mutual_funds(mutual_funds)
+    live_navs, nav_status = resolve_mf_navs(mutual_funds, use_live)
+    enriched = enrich_mutual_funds(mutual_funds, live_navs)
     metrics = compute_mutual_fund_metrics(enriched)
+
+    st.caption(nav_status)
+    at_file = enriched.loc[enriched["nav_source"] == "File", "fund_name"].tolist()
+    if use_live and at_file and len(at_file) < len(enriched):
+        st.warning(f"No live NAV for {', '.join(at_file)} - using the NAV from the file.",
+                   icon=":material/warning:")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
@@ -2375,6 +2697,7 @@ def render_tab_mutual_funds(mutual_funds: pd.DataFrame) -> None:
         "current_nav": "Current NAV", "invested_value": "Invested",
         "current_value": "Current Value", "unrealized_pnl": "Unrealised P&L",
         "unrealized_pnl_pct": "P&L %", "xirr_pct": "XIRR %", "weight_pct": "Weight",
+        "nav_source": "NAV Source",
     }
     table = (
         enriched.sort_values("current_value", ascending=False)[list(columns)]
@@ -2440,6 +2763,8 @@ def main() -> None:
 
     if controls.refresh_prices:
         fetch_live_prices.clear()
+        fetch_live_mf_navs.clear()
+        fetch_benchmark_series.clear()
         st.toast("Refreshing market prices...", icon=":material/refresh:")
 
     as_of = pd.Timestamp(datetime.now(IST).date())
@@ -2463,7 +2788,7 @@ def main() -> None:
         "Tax & Holding Period", "Mutual Funds", "All Holdings",
     ])
     with tab_overview:
-        render_tab_overview(metrics, enriched, as_of)
+        render_tab_overview(metrics, enriched, trades, as_of)
     with tab_sector:
         render_tab_sector(enriched)
     with tab_cap:
@@ -2471,7 +2796,7 @@ def main() -> None:
     with tab_tax:
         render_tab_tax(enriched, trades, as_of)
     with tab_mf:
-        render_tab_mutual_funds(mutual_funds)
+        render_tab_mutual_funds(mutual_funds, controls.use_live_prices)
     with tab_all:
         render_tab_all_holdings(enriched)
 

@@ -5,3 +5,4 @@ yfinance>=0.2.54
 scipy>=1.11
 openpyxl>=3.1
 plotly>=5.24
+requests>=2.31
